@@ -9,7 +9,8 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 from scipy.stats import ks_2samp
-from matplotlib.lines import Line2D
+from sklearn.decomposition import FastICA
+import seaborn as sns
 
 print("Start")
 
@@ -17,6 +18,7 @@ DATASET = "adamson16"
 PERTURBATIONS = ["AMIGO3", "ARHGAP22"]
 CONTROL_LABEL = "control"  # Change to "control" or "non-targeting" based on dataset
 KS_THRESHOLD = 0.04  # Threshold on the KS statistic D for log-transformed data
+N_ICA_COMPONENTS = 12  # Number of independent components
 
 DATA_PATH = Path(os.environ.get(
     "ADAMSON_PATH",
@@ -65,13 +67,13 @@ print(f"Combined balanced subset shape (control + all perturbations): {adata_com
 # --- Step 3: Compute DEGs using KS test for each perturbation vs control, then take union ---
 X_data = adata_combined.X.toarray() if hasattr(adata_combined.X, "toarray") else adata_combined.X
 gene_names = adata_combined.var_names
-ctrl_mask_sub = (adata_combined.obs["perturbation"] == CONTROL_LABEL).values
 
 union_selected_genes = set()
 
 for pert in PERTURBATIONS:
     print(f"Computing KS test for {pert} vs control...")
     pert_mask_sub = (adata_combined.obs["perturbation"] == pert).values
+    ctrl_mask_sub = (adata_combined.obs["perturbation"] == CONTROL_LABEL).values
     
     ks_results = []
     for i, gene in enumerate(gene_names):
@@ -87,11 +89,6 @@ for pert in PERTURBATIONS:
     top_genes_df = pd.DataFrame(ks_results)
     top_genes_df = top_genes_df.sort_values(by='statistic_D', ascending=False).reset_index(drop=True)
 
-    # Save individual DE table to CSV
-    de_csv_path = OUT_DIR / f"de_genes_{DATASET}_{pert}.csv"
-    top_genes_df.to_csv(de_csv_path, index=False)
-    print(f"Saved DE table: {de_csv_path}")
-
     # Select genes passing KS threshold
     selected_for_pert = top_genes_df.loc[top_genes_df['statistic_D'] >= KS_THRESHOLD, 'gene'].values
     if len(selected_for_pert) == 0:
@@ -104,59 +101,63 @@ for pert in PERTURBATIONS:
 final_selected_genes = [g for g in union_selected_genes if g in adata_combined.var_names]
 print(f"Total unique union DE genes selected across perturbations: {len(final_selected_genes)}")
 
-# --- Step 4: Run PCA on the union of DE genes ---
-adata_pca = adata_combined[:, final_selected_genes].copy()
-n_comps = min(50, len(final_selected_genes), adata_pca.n_obs - 1)
-sc.pp.pca(adata_pca, n_comps=n_comps)
-var_ratio = adata_pca.uns["pca"]["variance_ratio"]
+# --- Step 4: Run ICA on the union of DE genes with 12 components ---
+adata_ica = adata_combined[:, final_selected_genes].copy()
+n_components_ica = min(N_ICA_COMPONENTS, len(final_selected_genes), adata_ica.n_obs - 1)
 
-print(f"Total variance explained by {n_comps} PCs: {var_ratio.sum() * 100:.2f}%")
+print(f"Running ICA to extract {n_components_ica} independent components...")
+ica_transformer = FastICA(n_components=n_components_ica, random_state=42, max_iter=1000)
+ica_matrix = ica_transformer.fit_transform(
+    adata_ica.X.toarray() if hasattr(adata_ica.X, "toarray") else adata_ica.X
+)
+adata_ica.obsm["X_ica"] = ica_matrix
+print(f"Number of independent components (ICs) found: {ica_matrix.shape[1]}")
 
-# --- Step 5: Save Scree Plot ---
-fig_scree, ax_scree = plt.subplots(figsize=(7, 4.5))
-ax_scree.plot(range(1, len(var_ratio) + 1), var_ratio * 100, marker='o', linestyle='-', color='teal', markersize=4)
-ax_scree.set_xlabel("Principal Component")
-ax_scree.set_ylabel("Variance Explained (%)")
-ax_scree.set_title(f"Scree Plot: {DATASET} - Multi-Perturbation Union DE")
-fig_scree.tight_layout()
+# --- Step 5: Plot smooth density curves for each IC across all groups ---
+fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+axes = axes.flatten()
 
-scree_path = OUT_DIR / f"scree_plot_pca_deg_{DATASET}_multi_pert.png"
-fig_scree.savefig(scree_path, dpi=200)
-plt.close(fig_scree)
-print("Saved scree plot:", scree_path)
-
-# --- Step 6: Run t-SNE on PCA Space (using first 12 PCs) ---
-print("Running t-SNE on PCA space...")
-sc.tl.tsne(adata_pca, n_pcs=12, random_state=42)
-tsne_coords = adata_pca.obsm["X_tsne"]
-
-# --- Step 7: Plot t-SNE with distinct colors for control and each perturbation ---
-fig, ax = plt.subplots(figsize=(8, 6.5))
-
-# Define color map for groups
+# High-visibility color palette
 color_map = {
-    CONTROL_LABEL: ("red", "Control"),
-    PERTURBATIONS[0]: ("blue", PERTURBATIONS[0]),
-    PERTURBATIONS[1]: ("green", PERTURBATIONS[1])
+    CONTROL_LABEL: ("#333333", "Control"),  # Dark Grey
+    PERTURBATIONS[0]: ("#009E73", PERTURBATIONS[0]),  # Bluish Green
+    PERTURBATIONS[1]: ("#D55E00", PERTURBATIONS[1])   # Vermillion
 }
 
-for group_name, (color, label_text) in color_map.items():
-    mask = (adata_pca.obs["perturbation"] == group_name).values
-    coords = tsne_coords[mask]
-    ax.scatter(coords[:, 0], coords[:, 1], c=color, s=6, alpha=0.4, label=f"{label_text} (n={len(coords)})", rasterized=True)
+for idx in range(n_components_ica):
+    ax = axes[idx]
+    ic_values = ica_matrix[:, idx]
+    
+    for group_name, (color, label_text) in color_map.items():
+        mask = (adata_ica.obs["perturbation"] == group_name).values
+        group_vals = ic_values[mask]
+        
+        # Plot smooth density estimate (KDE) line with subtle shading
+        sns.kdeplot(
+            group_vals, 
+            ax=ax, 
+            color=color, 
+            label=label_text, 
+            fill=True, 
+            alpha=0.15, 
+            linewidth=1.5
+        )
+    
+    ax.set_title(f"IC {idx + 1}", fontsize=10, fontweight='bold')
+    ax.set_xlabel("")
+    ax.set_ylabel("Density" if idx % 4 == 0 else "")
+    ax.legend(loc="upper right", fontsize=7, framealpha=0.8)
 
-ax.legend(loc="upper right", framealpha=0.9, fontsize=9)
-ax.set_xticks([])
-ax.set_yticks([])
-ax.set_xlabel("")
-ax.set_ylabel("")
-ax.set_title(f"t-SNE (Union KS DE, D >= {KS_THRESHOLD}): {DATASET}\nMulti-Perturbation vs Control")
+# Hide any empty subplots if fewer than 12 components were found
+for idx in range(n_components_ica, len(axes)):
+    fig.delaxes(axes[idx])
 
-fig.tight_layout()
+fig.suptitle(f"ICA Component Density Distributions (Union KS DE, D >= {KS_THRESHOLD})", fontsize=14, fontweight='bold')
+fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-out_path = OUT_DIR / f"tsne_pca_deg_{DATASET}_multi_pert_vs_control.png"
+out_path = OUT_DIR / f"ica_density_distributions_{DATASET}.png"
 fig.savefig(out_path, dpi=200)
 plt.close(fig)
-print("Saved multi-perturbation t-SNE plot:", out_path)
+print("Saved ICA density plot:", out_path)
 
 print("Done!")
