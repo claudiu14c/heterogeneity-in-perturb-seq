@@ -6,17 +6,13 @@ import matplotlib
 matplotlib.use("Agg")  # no display on the cluster; render straight to file
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import scanpy as sc
-from scipy.stats import ks_2samp
-from matplotlib.lines import Line2D
 
 print("Start")
 
 DATASET = "adamson16"
-PERTURBATIONS = ["AMIGO3", "ARHGAP22"]
+PERTURBATIONS = ["STT3A", "OST4"]
 CONTROL_LABEL = "control"  # Change to "control" or "non-targeting" based on dataset
-KS_THRESHOLD = 0.04  # Threshold on the KS statistic D to select differentially expressed genes
 
 DATA_PATH = Path(os.environ.get(
     "ADAMSON_PATH",
@@ -29,122 +25,131 @@ print(f"Loading dataset from: {DATA_PATH}")
 adata_full = ad.read_h5ad(DATA_PATH)
 print(f"Full dataset shape: {adata_full.shape}")
 
-for PERTURBATION in PERTURBATIONS:
-    print(f"\n--- Processing perturbation: {PERTURBATION} ---")
+# 1. Compute DEGs for each perturbation individually and take the union
+union_de_genes = set()
+ctrl_mask = (adata_full.obs["perturbation"] == CONTROL_LABEL).values
+ctrl_indices = np.where(ctrl_mask)[0]
 
-    # Create masks for perturbation and control
-    pert_mask = (adata_full.obs["perturbation"] == PERTURBATION).values
-    ctrl_mask = (adata_full.obs["perturbation"] == CONTROL_LABEL).values
+deg_counts = {}
 
+for pert in PERTURBATIONS:
+    print(f"\n--- Finding DEGs for perturbation: {pert} vs {CONTROL_LABEL} ---")
+    pert_mask = (adata_full.obs["perturbation"] == pert).values
+    
     n_pert = pert_mask.sum()
-    n_ctrl = ctrl_mask.sum()
-
-    print(f"Number of perturbation cells: {n_pert}")
-    print(f"Number of control cells available: {n_ctrl}")
+    print(f"Number of cells for {pert}: {n_pert}")
 
     if n_pert == 0:
-        print(f"Warning: No cells found for {PERTURBATION}. Skipping.")
+        print(f"Warning: No cells found for {pert}. Skipping.")
+        deg_counts[pert] = 0
         continue
-
-    # Get indices & randomly downsample controls to match perturbation cells
-    pert_indices = np.where(pert_mask)[0]
-    ctrl_indices = np.where(ctrl_mask)[0]
-
-    np.random.seed(42)  # Set seed for reproducibility
-    if n_ctrl > n_pert:
-        sampled_ctrl_indices = np.random.choice(ctrl_indices, size=n_pert, replace=False)
-    else:
-        sampled_ctrl_indices = ctrl_indices
-
-    # Combine indices and subset AnnData
-    combined_indices = np.concatenate([pert_indices, sampled_ctrl_indices])
-    adata = adata_full[combined_indices].copy()
-    print(f"Balanced subset shape (pert + sampled control): {adata.shape}")
-
-    # --- 1. Find Differentially Expressed Genes Before PCA (using KS test) ---
-    X_data = adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X
-    gene_names = adata.var_names
+        
+    # Subset to this perturbation + control for DE testing
+    sub_indices = np.where(pert_mask | ctrl_mask)[0]
+    adata_sub = adata_full[sub_indices].copy()
     
-    pert_mask_sub = (adata.obs["perturbation"] == PERTURBATION).values
-    ctrl_mask_sub = (adata.obs["perturbation"] == CONTROL_LABEL).values
-
-    ks_results = []
-    for i, gene in enumerate(gene_names):
-        expr_pert = X_data[pert_mask_sub, i]
-        expr_ctrl = X_data[ctrl_mask_sub, i]
-        res = ks_2samp(expr_pert, expr_ctrl)
-        ks_results.append({
-            'gene': gene,
-            'statistic_D': res.statistic,
-            'pvals': res.pvalue
-        })
-
-    top_genes_df = pd.DataFrame(ks_results)
-    top_genes_df = top_genes_df.sort_values(by='statistic_D', ascending=False).reset_index(drop=True)
-
-    # Save DE table to CSV
-    de_csv_path = OUT_DIR / f"de_genes_{DATASET}_{PERTURBATION}.csv"
-    top_genes_df.to_csv(de_csv_path, index=False)
-    print(f"Saved DE table: {de_csv_path}")
-
-    # --- 2. Subset AnnData to DE Genes passing KS threshold for PCA ---
-    selected_genes = top_genes_df.loc[top_genes_df['statistic_D'] >= KS_THRESHOLD, 'gene'].values
-    # Ensure genes exist in adata variables
-    selected_genes = [g for g in selected_genes if g in adata.var_names]
+    sc.tl.rank_genes_groups(
+        adata_sub, 
+        groupby="perturbation", 
+        groups=[pert], 
+        reference=CONTROL_LABEL, 
+        method="wilcoxon"
+    )
     
-    print(f"Running PCA on {len(selected_genes)} DE genes passing KS threshold D >= {KS_THRESHOLD}...")
-    if len(selected_genes) == 0:
-        print("Warning: No genes passed the KS threshold. Falling back to top 500 genes.")
-        selected_genes = top_genes_df['gene'].head(500).values
-        selected_genes = [g for g in selected_genes if g in adata.var_names]
-
-    adata_pca = adata[:, selected_genes].copy()
-
-    n_comps = min(50, len(selected_genes), adata_pca.n_obs - 1)
-    sc.pp.pca(adata_pca, n_comps=n_comps)
-    pcs = adata_pca.obsm["X_pca"]
-    var_ratio = adata_pca.uns["pca"]["variance_ratio"]
-
-    print(f"Total variance explained by {n_comps} PCs: {var_ratio.sum() * 100:.2f}%")
-
-    # Separate PC coordinates by group
-    is_pert = (adata_pca.obs["perturbation"] == PERTURBATION).values
-    pcs_pert = pcs[is_pert]
-    pcs_ctrl = pcs[~is_pert]
-
-    # Compute means (centroids) for PC1 and PC2
-    mean_pert = np.mean(pcs_pert[:, :2], axis=0)
-    mean_ctrl = np.mean(pcs_ctrl[:, :2], axis=0)
-
-    fig, ax = plt.subplots(figsize=(8, 6.5))
-
-    # Scatter plot
-    ax.scatter(pcs_pert[:, 0], pcs_pert[:, 1], c="blue", s=6, alpha=0.4, label=f"{PERTURBATION} (n={n_pert})", rasterized=True)
-    ax.scatter(pcs_ctrl[:, 0], pcs_ctrl[:, 1], c="red", s=6, alpha=0.4, label=f"{CONTROL_LABEL} (n={len(pcs_ctrl)})", rasterized=True)
-
-    # Plot means / centroids
-    ax.scatter(mean_pert[0], mean_pert[1], c="blue", marker="*", s=250, edgecolor="black", linewidth=1.2, label=f"{PERTURBATION} Mean", zorder=5)
-    ax.scatter(mean_ctrl[0], mean_ctrl[1], c="red", marker="*", s=250, edgecolor="black", linewidth=1.2, label=f"{CONTROL_LABEL} Mean", zorder=5)
-
-    # Fit and plot Linear Regression Lines (PC2 vs PC1)
-    slope_pert, intercept_pert = np.polyfit(pcs_pert[:, 0], pcs_pert[:, 1], 1)
-    x_pert_range = np.linspace(pcs_pert[:, 0].min(), pcs_pert[:, 0].max(), 100)
-    ax.plot(x_pert_range, slope_pert * x_pert_range + intercept_pert, color="darkblue", linewidth=2.5, linestyle="--", label=f"{PERTURBATION} Fit")
-
-    slope_ctrl, intercept_ctrl = np.polyfit(pcs_ctrl[:, 0], pcs_ctrl[:, 1], 1)
-    x_ctrl_range = np.linspace(pcs_ctrl[:, 0].min(), pcs_ctrl[:, 0].max(), 100)
-    ax.plot(x_ctrl_range, slope_ctrl * x_ctrl_range + intercept_ctrl, color="darkred", linewidth=2.5, linestyle="--", label=f"{CONTROL_LABEL} Fit")
-
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=9)
-    ax.set_xlabel(f"PC1 ({var_ratio[0]*100:.1f}%)")
-    ax.set_ylabel(f"PC2 ({var_ratio[1]*100:.1f}%)")
-    ax.set_title(f"PCA (KS DE, D >= {KS_THRESHOLD}): {DATASET}\n{PERTURBATION} vs Control")
+    de_df = sc.get.rank_genes_groups_df(adata_sub, group=pert)
     
-    fig.tight_layout()
+    # Filter by adjusted p-value < 0.05 AND absolute log fold change > 0.1
+    sig_de_df = de_df[
+        (de_df["pvals_adj"] < 0.05) & (de_df["logfoldchanges"].abs() > 0.1)
+    ]
+    genes = sig_de_df["names"].values
+    
+    if len(genes) == 0:
+        print(f"Warning: No significant DEGs found for {pert} with p_adj < 0.05 & |logFC| > 0.1. Using top 100 unadjusted.")
+        genes = de_df["names"].values[:100]
+        
+    deg_counts[pert] = len(genes)
+    print(f"-> Significant DEGs for {pert}: {len(genes)}")
+    union_de_genes.update(genes)
 
-    out_path = OUT_DIR / f"pca_deg_{DATASET}_{PERTURBATION}_vs_balanced_control.png"
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-    print("Saved:", out_path)
+# Filter to genes actually present in the dataset
+union_de_genes = [g for g in union_de_genes if g in adata_full.var_names]
+total_union_size = len(union_de_genes)
+
+print("\n===============================")
+print("DEGs Summary (p_adj < 0.05, |logFC| > 0.1):")
+for pert, count in deg_counts.items():
+    print(f"  - {pert}: {count} DEGs")
+print(f"  - Total Unique Union DEGs: {total_union_size}")
+print("===============================\n")
+
+# 2. Prepare Subsets using the Union of DEGs
+pert_mask_all = adata_full.obs["perturbation"].isin(PERTURBATIONS).values
+pert_indices = np.where(pert_mask_all)[0]
+combined_indices = np.concatenate([pert_indices, ctrl_indices])
+
+# Controls-only subset on union DEGs
+adata_ctrl = adata_full[ctrl_indices, :][:, union_de_genes].copy()
+sc.pp.pca(adata_ctrl, n_comps=2)
+pcs_ctrl_only = adata_ctrl.obsm["X_pca"]
+var_ratio_ctrl = adata_ctrl.uns["pca"]["variance_ratio"]
+
+# Combined subset (Controls + All Perturbations) on union DEGs
+adata_combined = adata_full[combined_indices, :][:, union_de_genes].copy()
+print("Running PCA on combined subset using union of DEGs...")
+sc.pp.pca(adata_combined, n_comps=2)
+pcs_combined = adata_combined.obsm["X_pca"]
+var_ratio_combined = adata_combined.uns["pca"]["variance_ratio"]
+
+# 3. Plotting
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# --- Subplot 1: Controls only ---
+axes[0].scatter(
+    pcs_ctrl_only[:, 0], pcs_ctrl_only[:, 1], 
+    c="red", s=6, alpha=0.4, 
+    label=f"{CONTROL_LABEL} (n={len(ctrl_indices)})", rasterized=True
+)
+axes[0].set_title("PCA (Union DEGs): Controls Only")
+axes[0].set_xlabel(f"PC1 ({var_ratio_ctrl[0]*100:.1f}%)")
+axes[0].set_ylabel(f"PC2 ({var_ratio_ctrl[1]*100:.1f}%)")
+axes[0].legend(loc="upper right", framealpha=0.9, fontsize=9)
+
+# --- Subplot 2: Controls + All Perturbations on the same plot ---
+is_ctrl_comb = (adata_combined.obs["perturbation"] == CONTROL_LABEL).values
+axes[1].scatter(
+    pcs_combined[is_ctrl_comb, 0], pcs_combined[is_ctrl_comb, 1], 
+    c="gray", s=6, alpha=0.2, 
+    label=f"{CONTROL_LABEL} (n={len(ctrl_indices)})", rasterized=True
+)
+
+colors = ["blue", "green", "purple", "orange", "cyan"]
+for i, pert in enumerate(PERTURBATIONS):
+    is_pert = (adata_combined.obs["perturbation"] == pert).values
+    n_pert = is_pert.sum()
+    color = colors[i % len(colors)]
+    
+    axes[1].scatter(
+        pcs_combined[is_pert, 0], pcs_combined[is_pert, 1], 
+        c=color, s=6, alpha=0.5, 
+        label=f"{pert} (n={n_pert})", rasterized=True
+    )
+
+axes[1].set_title("PCA (Union DEGs): Combined Perturbations vs All Controls")
+axes[1].set_xlabel(f"PC1 ({var_ratio_combined[0]*100:.1f}%)")
+axes[1].set_ylabel(f"PC2 ({var_ratio_combined[1]*100:.1f}%)")
+axes[1].legend(loc="upper right", framealpha=0.9, fontsize=9)
+
+# Format DEG summary text for the figure title
+deg_summary_parts = [f"{p}: {c} DEGs" for p, c in deg_counts.items()]
+deg_text = " | ".join(deg_summary_parts) + f" | Union Total: {total_union_size} DEGs"
+
+fig.suptitle(f"Dataset: {DATASET} | Combined Perturbations\n{deg_text}", fontsize=10)
+fig.tight_layout()
+
+out_path = OUT_DIR / f"pca12_{DATASET}_combined_perturbations_union_degs.png"
+fig.savefig(out_path, dpi=200)
+plt.close(fig)
+print("Saved:", out_path)
 
 print("Done!")

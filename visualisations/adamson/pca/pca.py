@@ -7,13 +7,12 @@ matplotlib.use("Agg")  # no display on the cluster; render straight to file
 import matplotlib.pyplot as plt
 import numpy as np
 import scanpy as sc
-from matplotlib.lines import Line2D
-from scipy.stats import ranksums
 
 print("Start")
 
 DATASET = "adamson16"
-PERTURBATIONS = ["AMIGO3", "ARHGAP22"]
+# unreliable, reliable
+PERTURBATIONS = ["STT3A", "OST4"]
 CONTROL_LABEL = "control"  # Change to "control" or "non-targeting" based on dataset
 
 DATA_PATH = Path(os.environ.get(
@@ -27,94 +26,90 @@ print(f"Loading dataset from: {DATA_PATH}")
 adata_full = ad.read_h5ad(DATA_PATH)
 print(f"Full dataset shape: {adata_full.shape}")
 
-for PERTURBATION in PERTURBATIONS:
-    print(f"\n--- Processing perturbation: {PERTURBATION} ---")
+# Create masks for controls and all specified perturbations
+ctrl_mask = (adata_full.obs["perturbation"] == CONTROL_LABEL).values
+pert_mask = adata_full.obs["perturbation"].isin(PERTURBATIONS).values
 
-    # Create masks for perturbation and control
-    pert_mask = (adata_full.obs["perturbation"] == PERTURBATION).values
-    ctrl_mask = (adata_full.obs["perturbation"] == CONTROL_LABEL).values
+n_ctrl = ctrl_mask.sum()
+n_pert_total = pert_mask.sum()
 
-    n_pert = pert_mask.sum()
-    n_ctrl = ctrl_mask.sum()
+print(f"Number of control cells available: {n_ctrl}")
+print(f"Total perturbation cells across {PERTURBATIONS}: {n_pert_total}")
 
-    print(f"Number of perturbation cells: {n_pert}")
-    print(f"Number of control cells available: {n_ctrl}")
+ctrl_indices = np.where(ctrl_mask)[0]
+pert_indices = np.where(pert_mask)[0]
 
-    if n_pert == 0:
-        print(f"Warning: No cells found for {PERTURBATION}. Skipping.")
-        continue
+# 1. Prepare Controls-only subset for Subplot 1
+adata_ctrl = adata_full[ctrl_indices].copy()
+sc.pp.pca(adata_ctrl, n_comps=20)
+pcs_ctrl_only = adata_ctrl.obsm["X_pca"]
+var_ratio_ctrl = adata_ctrl.uns["pca"]["variance_ratio"]
 
-    # Get indices
-    pert_indices = np.where(pert_mask)[0]
-    ctrl_indices = np.where(ctrl_mask)[0]
+# 2. Prepare Combined subset (Control + All Perturbations) for Subplot 2
+combined_indices = np.concatenate([pert_indices, ctrl_indices])
+adata_combined = adata_full[combined_indices].copy()
 
-    # Randomly downsample controls to match the number of perturbation cells
-    np.random.seed(42)  # Set seed for reproducibility
-    if n_ctrl > n_pert:
-        sampled_ctrl_indices = np.random.choice(ctrl_indices, size=n_pert, replace=False)
-    else:
-        sampled_ctrl_indices = ctrl_indices
+print("Running PCA on combined controls + all perturbations...")
+sc.pp.pca(adata_combined, n_comps=50)
+pcs_combined = adata_combined.obsm["X_pca"]
+var_ratio_combined = adata_combined.uns["pca"]["variance_ratio"]
 
-    # Combine indices and subset AnnData
-    combined_indices = np.concatenate([pert_indices, sampled_ctrl_indices])
-    adata = adata_full[combined_indices].copy()
-    print(f"Balanced subset shape (pert + sampled control): {adata.shape}")
+# Create figure with 2 subplots side-by-side
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-    # PCA on adata.X (n_comps=50)
-    n_comps = 50
-    sc.pp.pca(adata, n_comps=n_comps)
-    pcs = adata.obsm["X_pca"]
-    var_ratio = adata.uns["pca"]["variance_ratio"]
+# --- Subplot 1: Controls only ---
+axes[0].scatter(
+    pcs_ctrl_only[:, 0], pcs_ctrl_only[:, 1], 
+    c="red", s=6, alpha=0.4, 
+    label=f"{CONTROL_LABEL} (n={n_ctrl})", rasterized=True
+)
+axes[0].set_title("PCA: Controls Only")
+axes[0].set_xlabel(f"PC1 ({var_ratio_ctrl[0]*100:.1f}%)")
+axes[0].set_ylabel(f"PC2 ({var_ratio_ctrl[1]*100:.1f}%)")
+axes[0].legend(loc="upper right", framealpha=0.9, fontsize=9)
 
-    # Separate PC coordinates by group
-    is_pert = (adata.obs["perturbation"] == PERTURBATION).values
-    pcs_pert = pcs[is_pert]
-    pcs_ctrl = pcs[~is_pert]
+# --- Subplot 2: Controls + All Perturbations on the same plot ---
+is_ctrl_comb = (adata_combined.obs["perturbation"] == CONTROL_LABEL).values
+axes[1].scatter(
+    pcs_combined[is_ctrl_comb, 0], pcs_combined[is_ctrl_comb, 1], 
+    c="gray", s=6, alpha=0.2, 
+    label=f"{CONTROL_LABEL} (n={n_ctrl})", rasterized=True
+)
 
-    # Compute means (centroids) for PC1 and PC2
-    mean_pert = np.mean(pcs_pert[:, :2], axis=0)
-    mean_ctrl = np.mean(pcs_ctrl[:, :2], axis=0)
-
-    fig, ax = plt.subplots(figsize=(8, 6.5))
-
-    # Scatter plot
-    ax.scatter(pcs_pert[:, 0], pcs_pert[:, 1], c="blue", s=6, alpha=0.4, label=f"{PERTURBATION} (n={n_pert})", rasterized=True)
-    ax.scatter(pcs_ctrl[:, 0], pcs_ctrl[:, 1], c="red", s=6, alpha=0.4, label=f"{CONTROL_LABEL} (n={len(pcs_ctrl)})", rasterized=True)
-
-    # Plot means / centroids
-    ax.scatter(mean_pert[0], mean_pert[1], c="blue", marker="*", s=250, edgecolor="black", linewidth=1.2, label=f"{PERTURBATION} Mean", zorder=5)
-    ax.scatter(mean_ctrl[0], mean_ctrl[1], c="red", marker="*", s=250, edgecolor="black", linewidth=1.2, label=f"{CONTROL_LABEL} Mean", zorder=5)
-
-    # Fit and plot Linear Regression Lines (PC2 vs PC1)
-    slope_pert, intercept_pert = np.polyfit(pcs_pert[:, 0], pcs_pert[:, 1], 1)
-    x_pert_range = np.linspace(pcs_pert[:, 0].min(), pcs_pert[:, 0].max(), 100)
-    ax.plot(x_pert_range, slope_pert * x_pert_range + intercept_pert, color="darkblue", linewidth=2.5, linestyle="--", label=f"{PERTURBATION} Fit")
-
-    slope_ctrl, intercept_ctrl = np.polyfit(pcs_ctrl[:, 0], pcs_ctrl[:, 1], 1)
-    x_ctrl_range = np.linspace(pcs_ctrl[:, 0].min(), pcs_ctrl[:, 0].max(), 100)
-    ax.plot(x_ctrl_range, slope_ctrl * x_ctrl_range + intercept_ctrl, color="darkred", linewidth=2.5, linestyle="--", label=f"{CONTROL_LABEL} Fit")
-
-
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=9)
-    ax.set_xlabel(f"PC1 ({var_ratio[0]*100:.1f}%)")
-    ax.set_ylabel(f"PC2 ({var_ratio[1]*100:.1f}%)")
-    ax.set_title(f"PCA: {DATASET} - {PERTURBATION} vs Balanced Control")
+# Plot each perturbation with a distinct color
+colors = ["blue", "green", "purple", "orange", "cyan"]
+for i, pert in enumerate(PERTURBATIONS):
+    is_pert = (adata_combined.obs["perturbation"] == pert).values
+    n_pert = is_pert.sum()
+    color = colors[i % len(colors)]
     
-    fig.tight_layout()
+    axes[1].scatter(
+        pcs_combined[is_pert, 0], pcs_combined[is_pert, 1], 
+        c=color, s=6, alpha=0.5, 
+        label=f"{pert} (n={n_pert})", rasterized=True
+    )
 
-    out_path = OUT_DIR / f"pca_{DATASET}_{PERTURBATION}_vs_balanced_control.png"
-    fig.savefig(out_path, dpi=200)
-    plt.close(fig)
-    print("Saved:", out_path)
+axes[1].set_title(f"PCA: Combined Perturbations vs All Controls")
+axes[1].set_xlabel(f"PC1 ({var_ratio_combined[0]*100:.1f}%)")
+axes[1].set_ylabel(f"PC2 ({var_ratio_combined[1]*100:.1f}%)")
+axes[1].legend(loc="upper right", framealpha=0.9, fontsize=9)
+
+fig.suptitle(f"Dataset: {DATASET} | Combined Perturbations", fontsize=12)
+fig.tight_layout()
+
+out_path = OUT_DIR / f"pca12_{DATASET}_combined_perturbations.png"
+fig.savefig(out_path, dpi=200)
+plt.close(fig)
+print("Saved:", out_path)
 
 print("Done!")
 
-Stop subsampling
-Always compute the Highly variable genes and DEGS on the whole population
+# Stop subsampling
+# Always compute the Highly variable genes and DEGS on the whole population
 
-1. Why do we have clusters on tsne
-    Cell cycle package (ICA , cell cycle, gene expression, PS score)
-    DO DEGS, HVG, nothing
-2. Why don t they correspond to splitting control from perturb?
-    Look at edistance per perturbation.
-    Look at the graph - compare it with Anna
+# 1. Why do we have clusters on tsne
+#     Cell cycle package (ICA , cell cycle, gene expression, PS score)
+#     DO DEGS, HVG, nothing
+# 2. Why don t they correspond to splitting control from perturb?
+#     Look at edistance per perturbation.
+#     Look at the graph - compare it with Anna
