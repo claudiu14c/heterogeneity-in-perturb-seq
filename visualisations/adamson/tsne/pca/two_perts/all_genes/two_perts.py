@@ -45,6 +45,7 @@ adata_combined = adata_full[combined_indices].copy()
 print("Running PCA on combined controls + all perturbations (n_comps=50)...")
 sc.pp.pca(adata_combined, n_comps=50)
 var_ratio_combined = adata_combined.uns["pca"]["variance_ratio"]
+pcs_combined = adata_combined.obsm["X_pca"]
 
 # --- 1. Plot Variance Explained for the first 50 PCs ---
 fig, ax = plt.subplots(figsize=(8, 5))
@@ -63,7 +64,7 @@ fig.savefig(var_out_path, dpi=200)
 plt.close(fig)
 print("Saved variance plot:", var_out_path)
 
-# --- 2. Run and Plot t-SNE computed on the first 12 PCs ---
+# --- 2. Run and Plot t-SNE computed on the first 12 PCs with Top-Left PCA Inset ---
 print("Running t-SNE on the first 12 PCs...")
 sc.tl.tsne(adata_combined, n_pcs=12)
 tsne_coords = adata_combined.obsm["X_tsne"]
@@ -95,6 +96,27 @@ ax.set_title(f"t-SNE (First 12 PCs) | {DATASET}")
 ax.set_xlabel("t-SNE 1")
 ax.set_ylabel("t-SNE 2")
 ax.legend(loc="upper right", framealpha=0.9, fontsize=9)
+
+# --- Add PCA (PC1 vs PC2) Subplot Inset in the Top Left Corner ---
+ax_inset = ax.inset_axes([0.03, 0.62, 0.32, 0.32])
+
+ax_inset.scatter(
+    pcs_combined[is_ctrl_comb, 0], pcs_combined[is_ctrl_comb, 1], 
+    c="gray", s=2, alpha=0.2, rasterized=True
+)
+for i, pert in enumerate(PERTURBATIONS):
+    is_pert = (adata_combined.obs["perturbation"] == pert).values
+    color = colors[i % len(colors)]
+    ax_inset.scatter(
+        pcs_combined[is_pert, 0], pcs_combined[is_pert, 1], 
+        c=color, s=2, alpha=0.5, rasterized=True
+    )
+
+ax_inset.set_title("PC1 vs PC2", fontsize=8, fontweight='bold')
+ax_inset.set_xlabel(f"PC1 ({var_ratio_combined[0]*100:.1f}%)", fontsize=7)
+ax_inset.set_ylabel(f"PC2 ({var_ratio_combined[1]*100:.1f}%)", fontsize=7)
+ax_inset.tick_params(labelsize=6)
+
 fig.tight_layout()
 
 tsne_out_path = OUT_DIR / f"tsne_12pcs_two_perts.png"
