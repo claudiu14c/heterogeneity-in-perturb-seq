@@ -7,14 +7,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy.stats import ks_2samp
+import scanpy as sc
 from sklearn.linear_model import Ridge
 
-print("Start Unreliable Perturbations PS Score Analysis")
+print("Start Unreliable Perturbations PS Score Analysis (No Downsampling)")
 
 DATASET = "adamson16"
 CONTROL_LABEL = "control"
-KS_THRESHOLD = 0.04
 BATCH_SIZE = 15  # 15 subplots per image (3 rows x 5 columns)
 
 SPLIT_CSV_URL = "reliability_adamson.csv"
@@ -39,7 +38,7 @@ except Exception as e:
     unreliable_perts = [
         "AMIGO3", "ATF4", "ERN1", "GMPPB", "GNPNAT1", "HYOU1", 
         "KCTD16", "MANF", "PSMA1", "PSMD12", "PTDSS1", "SEC63", 
-        "SLC35B1", "STT3A", "TTI2", "XBP1"
+        "SLC35B1", "STT3A", "TTI2" #, "XBP1" ignore the last one so that all first 15 fit on one plot
     ]
 
 # Keep only those present in the dataset
@@ -48,7 +47,7 @@ print(f"Found {len(available_perts)} unreliable perturbations in dataset: {avail
 
 ctrl_mask_full = (adata_full.obs["perturbation"] == CONTROL_LABEL).values
 ctrl_indices_full = np.where(ctrl_mask_full)[0]
-n_ctrl_total = len(ctrl_indices_full)
+print(f"Using all {len(ctrl_indices_full)} control cells across all perturbations.")
 
 # Process unreliable perturbations in batches of BATCH_SIZE (15)
 for batch_idx, i in enumerate(range(0, len(available_perts), BATCH_SIZE)):
@@ -70,32 +69,46 @@ for batch_idx, i in enumerate(range(0, len(available_perts), BATCH_SIZE)):
             ax.set_title(f"{target_pert} [unreliable]", fontsize=9, fontweight='bold', color='red')
             continue
 
-        # Downsample controls to match perturbation size for balanced estimation
+        # Use ALL control cells combined with this perturbation's cells (NO downsampling)
         pert_indices = np.where(pert_mask)[0]
-        np.random.seed(42)
-        sampled_ctrl_indices = np.random.choice(ctrl_indices_full, size=min(n_ctrl_total, n_pert), replace=False)
-
-        sub_indices = np.concatenate([pert_indices, sampled_ctrl_indices])
+        sub_indices = np.concatenate([pert_indices, ctrl_indices_full])
         adata_sub = adata_full[sub_indices].copy()
 
-        # Step 1: Identify top downstream DEGs for this perturbation via KS test
-        X_data = adata_sub.X.toarray() if hasattr(adata_sub.X, "toarray") else adata_sub.X
-        gene_names = adata_sub.var_names
         sub_pert_mask = (adata_sub.obs["perturbation"] == target_pert).values
         sub_ctrl_mask = (adata_sub.obs["perturbation"] == CONTROL_LABEL).values
 
-        ks_results = []
-        for g_idx, gene in enumerate(gene_names):
-            res = ks_2samp(X_data[sub_pert_mask, g_idx], X_data[sub_ctrl_mask, g_idx])
-            ks_results.append({'gene': gene, 'statistic_D': res.statistic})
-
-        de_df = pd.DataFrame(ks_results).sort_values(by='statistic_D', ascending=False)
-        target_genes = de_df.loc[de_df['statistic_D'] >= KS_THRESHOLD, 'gene'].head(50).values
+        # Step 1: Identify downstream DEGs using Wilcoxon rank-sum test
+        sc.tl.rank_genes_groups(
+            adata_sub, 
+            groupby="perturbation", 
+            groups=[target_pert], 
+            reference=CONTROL_LABEL, 
+            method="wilcoxon"
+        )
+        de_df = sc.get.rank_genes_groups_df(adata_sub, group=target_pert)
+        
+        # Order by p-values and filter by absolute log fold change > 0.1
+        de_df = de_df.sort_values(by="pvals", ascending=True)
+        filtered_de = de_df[ (de_df["logfoldchanges"].abs() > 0.1)]
+        # If fewer than 10 pass, fall back to the top 10 ranked genes
+        if len(filtered_de) < 10:
+            filtered_de = de_df.head(min(10, len(de_df)))
+        print(f"Perturbation {target_pert}: {len(filtered_de)} DEGs found after filtering")
+        
+        target_genes = filtered_de["names"].head(50).values
         if len(target_genes) < 5:
-            target_genes = de_df['gene'].head(20).values
+            target_genes = de_df["names"].head(20).values
 
         # Step 2: Compute PS Score via Ridge Regression beta weights
-        Y = X_data[:, [np.where(gene_names == g)[0][0] for g in target_genes]]
+        X_data = adata_sub.X.toarray() if hasattr(adata_sub.X, "toarray") else adata_sub.X
+        gene_names = adata_sub.var_names
+
+        valid_target_genes = [g for g in target_genes if g in gene_names]
+        if len(valid_target_genes) == 0:
+            valid_target_genes = gene_names[:20]
+
+        gene_indices = [np.where(gene_names == g)[0][0] for g in valid_target_genes]
+        Y = X_data[:, gene_indices]
         D = sub_pert_mask.astype(int).reshape(-1, 1)
 
         ridge = Ridge(alpha=0.01)
@@ -129,7 +142,7 @@ for batch_idx, i in enumerate(range(0, len(available_perts), BATCH_SIZE)):
         sns.kdeplot(
             pert_vals,
             ax=ax,
-            color="#D55E00",  # Vermillion for unreliable / alternate category
+            color="#D55E00",  # Vermillion for unreliable
             label=target_pert,
             fill=True,
             alpha=0.15,
@@ -145,7 +158,7 @@ for batch_idx, i in enumerate(range(0, len(available_perts), BATCH_SIZE)):
     for idx in range(len(batch_perts), len(axes)):
         fig.delaxes(axes[idx])
 
-    fig.suptitle(f"PS Score Density: Unreliable Perturbations Batch {batch_idx + 1} vs Control", fontsize=14, fontweight='bold')
+    fig.suptitle(f"PS Score Density: Unreliable Perturbations Batch {batch_idx + 1} vs Control (Full Controls)", fontsize=14, fontweight='bold')
     fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
     out_path = OUT_DIR / f"ps_score_unreliable_batch_{batch_idx + 1}_{DATASET}.png"
