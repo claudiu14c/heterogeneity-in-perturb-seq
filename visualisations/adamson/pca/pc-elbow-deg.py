@@ -109,7 +109,7 @@ ax.grid(True, linestyle='--', alpha=0.5)
 
 fig.tight_layout()
 
-out_path = OUT_DIR / f"elbow_pca_{DATASET}_combined_perturbations_union_degs.png"
+out_path = OUT_DIR / f"pc_elbow_{DATASET}_combined_perturbations_union_degs.png"
 fig.savefig(out_path, dpi=200)
 plt.close(fig)
 

@@ -8,16 +8,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scanpy as sc
-from scipy.stats import ks_2samp
 from sklearn.decomposition import FastICA
 import seaborn as sns
 
 print("Start")
 
 DATASET = "adamson16"
-PERTURBATIONS = ["AMIGO3", "ARHGAP22"]
-CONTROL_LABEL = "control"  # Change to "control" or "non-targeting" based on dataset
-KS_THRESHOLD = 0.04  # Threshold on the KS statistic D for log-transformed data
+PERTURBATIONS = ["STT3A", "OST4"]
+CONTROL_LABEL = "control"
 N_ICA_COMPONENTS = 12  # Number of independent components
 
 DATA_PATH = Path(os.environ.get(
@@ -31,71 +29,61 @@ print(f"Loading dataset from: {DATA_PATH}")
 adata_full = ad.read_h5ad(DATA_PATH)
 print(f"Full dataset shape: {adata_full.shape}")
 
-# --- Step 1: Collect masks and cell counts for both perturbations ---
-pert_masks = {}
-n_perts = {}
-for pert in PERTURBATIONS:
-    mask = (adata_full.obs["perturbation"] == pert).values
-    pert_masks[pert] = mask
-    n_perts[pert] = mask.sum()
-    print(f"Number of perturbation cells for {pert}: {n_perts[pert]}")
-    if n_perts[pert] == 0:
-        print(f"Warning: No cells found for {pert}.")
-
+# --- Step 1: Collect masks and cell counts for both perturbations and control ---
 ctrl_mask = (adata_full.obs["perturbation"] == CONTROL_LABEL).values
-n_ctrl_total = ctrl_mask.sum()
-print(f"Number of control cells available: {n_ctrl_total}")
-
-# --- Step 2: Downsample control cells to average size of the perturbations ---
-avg_pert_size = int(np.mean(list(n_perts.values())))
-print(f"Target downsampled control size (average of perturbation sizes): {avg_pert_size}")
-
 ctrl_indices = np.where(ctrl_mask)[0]
-np.random.seed(42)  # Set seed for reproducibility
-if n_ctrl_total > avg_pert_size:
-    sampled_ctrl_indices = np.random.choice(ctrl_indices, size=avg_pert_size, replace=False)
-else:
-    sampled_ctrl_indices = ctrl_indices
+print(f"Number of control cells available: {len(ctrl_indices)}")
 
-# Combine control and all perturbation cell indices
-all_pert_indices = np.concatenate([np.where(pert_masks[pert])[0] for pert in PERTURBATIONS])
-combined_indices = np.concatenate([sampled_ctrl_indices, all_pert_indices])
+pert_indices_list = []
+for pert in PERTURBATIONS:
+    pert_mask = (adata_full.obs["perturbation"] == pert).values
+    n_pert = pert_mask.sum()
+    print(f"Number of perturbation cells for {pert}: {n_pert}")
+    if n_pert == 0:
+        print(f"Warning: No cells found for {pert}.")
+    pert_indices_list.append(np.where(pert_mask)[0])
+
+# --- Step 2: Combine all control and perturbation cells (NO subsampling) ---
+all_pert_indices = np.concatenate(pert_indices_list)
+combined_indices = np.concatenate([ctrl_indices, all_pert_indices])
 
 adata_combined = adata_full[combined_indices].copy()
-print(f"Combined balanced subset shape (control + all perturbations): {adata_combined.shape}")
+print(f"Combined subset shape (all controls + all specified perturbations): {adata_combined.shape}")
 
-# --- Step 3: Compute DEGs using KS test for each perturbation vs control, then take union ---
-X_data = adata_combined.X.toarray() if hasattr(adata_combined.X, "toarray") else adata_combined.X
-gene_names = adata_combined.var_names
-
+# --- Step 3: Compute DEGs using Wilcoxon rank-sum test for each perturbation vs control, take union ---
 union_selected_genes = set()
 
 for pert in PERTURBATIONS:
-    print(f"Computing KS test for {pert} vs control...")
+    print(f"Computing Wilcoxon rank-sum DEGs for {pert} vs control...")
     pert_mask_sub = (adata_combined.obs["perturbation"] == pert).values
     ctrl_mask_sub = (adata_combined.obs["perturbation"] == CONTROL_LABEL).values
     
-    ks_results = []
-    for i, gene in enumerate(gene_names):
-        expr_pert = X_data[pert_mask_sub, i]
-        expr_ctrl = X_data[ctrl_mask_sub, i]
-        res = ks_2samp(expr_pert, expr_ctrl)
-        ks_results.append({
-            'gene': gene,
-            'statistic_D': res.statistic,
-            'pvals': res.pvalue
-        })
-
-    top_genes_df = pd.DataFrame(ks_results)
-    top_genes_df = top_genes_df.sort_values(by='statistic_D', ascending=False).reset_index(drop=True)
-
-    # Select genes passing KS threshold
-    selected_for_pert = top_genes_df.loc[top_genes_df['statistic_D'] >= KS_THRESHOLD, 'gene'].values
-    if len(selected_for_pert) == 0:
-        print(f"Warning: No genes passed KS threshold for {pert}. Falling back to top 500.")
-        selected_for_pert = top_genes_df['gene'].head(500).values
+    # Subset to this perturbation + control for DE testing
+    sub_indices = np.where(pert_mask_sub | ctrl_mask_sub)[0]
+    adata_sub = adata_combined[sub_indices].copy()
     
-    union_selected_genes.update(selected_for_pert)
+    sc.tl.rank_genes_groups(
+        adata_sub, 
+        groupby="perturbation", 
+        groups=[pert], 
+        reference=CONTROL_LABEL, 
+        method="wilcoxon"
+    )
+    
+    de_df = sc.get.rank_genes_groups_df(adata_sub, group=pert)
+    
+    # Filter by adjusted p-value < 0.05 AND absolute log fold change > 0.1
+    sig_de_df = de_df[
+        (de_df["pvals_adj"] < 0.05) & (de_df["logfoldchanges"].abs() > 0.1)
+    ]
+    genes = sig_de_df["names"].values
+    
+    if len(genes) == 0:
+        print(f"Warning: No significant DEGs found for {pert}. Using top 100 unadjusted.")
+        genes = de_df["names"].values[:100]
+        
+    print(f"-> Significant DEGs for {pert}: {len(genes)}")
+    union_selected_genes.update(genes)
 
 # Filter union list to ensure they exist in AnnData variables
 final_selected_genes = [g for g in union_selected_genes if g in adata_combined.var_names]
@@ -152,10 +140,10 @@ for idx in range(n_components_ica):
 for idx in range(n_components_ica, len(axes)):
     fig.delaxes(axes[idx])
 
-fig.suptitle(f"ICA Component Density Distributions (Union KS DE, D >= {KS_THRESHOLD})", fontsize=14, fontweight='bold')
+fig.suptitle(f"ICA Component Density Distributions (Wilcoxon Union DEGs)", fontsize=14, fontweight='bold')
 fig.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-out_path = OUT_DIR / f"ica_density_distributions_{DATASET}.png"
+out_path = OUT_DIR / f"ica_on_deg_density_distributions_{PERTURBATIONS[0]}_{PERTURBATIONS[1]}.png"
 fig.savefig(out_path, dpi=200)
 plt.close(fig)
 print("Saved ICA density plot:", out_path)
