@@ -58,7 +58,7 @@ ax.set_ylabel("Variance Explained (%)")
 ax.grid(True, linestyle="--", alpha=0.5)
 fig.tight_layout()
 
-var_out_path = OUT_DIR / f"pca_variance_ratio_{DATASET}.png"
+var_out_path = OUT_DIR / f"pca_variance_ratio_two_perts.png"
 fig.savefig(var_out_path, dpi=200)
 plt.close(fig)
 print("Saved variance plot:", var_out_path)
@@ -97,7 +97,7 @@ ax.set_ylabel("t-SNE 2")
 ax.legend(loc="upper right", framealpha=0.9, fontsize=9)
 fig.tight_layout()
 
-tsne_out_path = OUT_DIR / f"tsne_12pcs_{DATASET}_combined_perturbations.png"
+tsne_out_path = OUT_DIR / f"tsne_12pcs_two_perts.png"
 fig.savefig(tsne_out_path, dpi=200)
 plt.close(fig)
 print("Saved t-SNE plot:", tsne_out_path)
