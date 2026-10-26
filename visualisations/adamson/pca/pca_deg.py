@@ -12,7 +12,7 @@ print("Start")
 
 DATASET = "adamson16"
 PERTURBATIONS = ["STT3A", "OST4"]
-CONTROL_LABEL = "control"  # Change to "control" or "non-targeting" based on dataset
+CONTROL_LABEL = "control"
 
 DATA_PATH = Path(os.environ.get(
     "ADAMSON_PATH",
@@ -83,62 +83,43 @@ for pert, count in deg_counts.items():
 print(f"  - Total Unique Union DEGs: {total_union_size}")
 print("===============================\n")
 
-# 2. Prepare Subsets using the Union of DEGs
+# 2. Prepare Combined Subset using the Union of DEGs
 pert_mask_all = adata_full.obs["perturbation"].isin(PERTURBATIONS).values
 pert_indices = np.where(pert_mask_all)[0]
 combined_indices = np.concatenate([pert_indices, ctrl_indices])
 
-# Controls-only subset on union DEGs
-adata_ctrl = adata_full[ctrl_indices, :][:, union_de_genes].copy()
-sc.pp.pca(adata_ctrl, n_comps=2)
-pcs_ctrl_only = adata_ctrl.obsm["X_pca"]
-var_ratio_ctrl = adata_ctrl.uns["pca"]["variance_ratio"]
-
-# Combined subset (Controls + All Perturbations) on union DEGs
 adata_combined = adata_full[combined_indices, :][:, union_de_genes].copy()
 print("Running PCA on combined subset using union of DEGs...")
-sc.pp.pca(adata_combined, n_comps=2)
+sc.pp.pca(adata_combined, n_comps=2, random_state=42)
 pcs_combined = adata_combined.obsm["X_pca"]
 var_ratio_combined = adata_combined.uns["pca"]["variance_ratio"]
 
-# 3. Plotting
-fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+# 3. Plotting Single Panel (Combined Perturbations vs Controls)
+fig, ax = plt.subplots(figsize=(8, 6))
 
-# --- Subplot 1: Controls only ---
-axes[0].scatter(
-    pcs_ctrl_only[:, 0], pcs_ctrl_only[:, 1], 
-    c="red", s=6, alpha=0.4, 
-    label=f"{CONTROL_LABEL} (n={len(ctrl_indices)})", rasterized=True
-)
-axes[0].set_title("PCA (Union DEGs): Controls Only")
-axes[0].set_xlabel(f"PC1 ({var_ratio_ctrl[0]*100:.1f}%)")
-axes[0].set_ylabel(f"PC2 ({var_ratio_ctrl[1]*100:.1f}%)")
-axes[0].legend(loc="upper right", framealpha=0.9, fontsize=9)
-
-# --- Subplot 2: Controls + All Perturbations on the same plot ---
 is_ctrl_comb = (adata_combined.obs["perturbation"] == CONTROL_LABEL).values
-axes[1].scatter(
+ax.scatter(
     pcs_combined[is_ctrl_comb, 0], pcs_combined[is_ctrl_comb, 1], 
     c="gray", s=6, alpha=0.2, 
     label=f"{CONTROL_LABEL} (n={len(ctrl_indices)})", rasterized=True
 )
 
-colors = ["blue", "green", "purple", "orange", "cyan"]
+colors = ["#0072B2", "#009E73", "#D55E00", "#CC79A7", "#F0E442"]
 for i, pert in enumerate(PERTURBATIONS):
     is_pert = (adata_combined.obs["perturbation"] == pert).values
     n_pert = is_pert.sum()
     color = colors[i % len(colors)]
     
-    axes[1].scatter(
+    ax.scatter(
         pcs_combined[is_pert, 0], pcs_combined[is_pert, 1], 
         c=color, s=6, alpha=0.5, 
         label=f"{pert} (n={n_pert})", rasterized=True
     )
 
-axes[1].set_title("PCA (Union DEGs): Combined Perturbations vs All Controls")
-axes[1].set_xlabel(f"PC1 ({var_ratio_combined[0]*100:.1f}%)")
-axes[1].set_ylabel(f"PC2 ({var_ratio_combined[1]*100:.1f}%)")
-axes[1].legend(loc="upper right", framealpha=0.9, fontsize=9)
+ax.set_title("PCA (Union DEGs): Combined Perturbations vs All Controls", fontsize=11, fontweight='bold')
+ax.set_xlabel(f"PC1 ({var_ratio_combined[0]*100:.1f}%)", fontsize=10)
+ax.set_ylabel(f"PC2 ({var_ratio_combined[1]*100:.1f}%)", fontsize=10)
+ax.legend(loc="upper right", framealpha=0.9, fontsize=9)
 
 # Format DEG summary text for the figure title
 deg_summary_parts = [f"{p}: {c} DEGs" for p, c in deg_counts.items()]
