@@ -26,6 +26,13 @@ print(f"Loading dataset from: {DATA_PATH}")
 adata_full = ad.read_h5ad(DATA_PATH)
 print(f"Full dataset shape: {adata_full.shape}")
 
+# 1. Compute Highly Variable Genes globally on ALL cells in the dataset
+print("Computing Global Highly Variable Genes (HVGs) on all cells...")
+sc.pp.highly_variable_genes(adata_full, n_top_genes=2000, flavor="seurat")
+hvg_mask = adata_full.var["highly_variable"].values
+print(f"Number of global HVGs selected: {hvg_mask.sum()}")
+adata_full = adata_full[:, hvg_mask].copy()
+
 # Create masks for controls and specified perturbations
 ctrl_mask = (adata_full.obs["perturbation"] == CONTROL_LABEL).values
 pert_mask = adata_full.obs["perturbation"].isin(PERTURBATIONS).values
