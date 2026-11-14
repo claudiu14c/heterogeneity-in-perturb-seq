@@ -1,0 +1,432 @@
+
+import os
+from pathlib import Path
+
+import anndata as ad
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import scanpy as sc
+from scipy import sparse
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+
+print("Start")
+
+K_NN = 20
+N_PCS_KNN = 15
+
+DATASETS = ["replogle22", "frangieh21"]
+PERTURBATIONS = [
+    "ARMC6",
+    "C1QBP",
+    "CCND1",
+    "CCT3",
+    "CDC123",
+    "CHCHD2",
+    "CTPS1",
+    "DNMT1",
+    "EEF1G",
+    "EIF4A1",
+    "FARSA",
+    "HLA-C",
+    "HNRNPC",
+    "ILF2",
+    "MT2A",
+    "MYC",
+    "NACA",
+    "NCL",
+    "NOLC1",
+    "PABPC1",
+    "PFDN4",
+    "PFN1",
+    "POLD2",
+    "PPA1",
+    "PPIA",
+    "PRELID3B",
+    "PTMA",
+    "PUF60",
+    "ROMO1",
+    "RPSA",
+    "RRS1",
+    "RUVBL2",
+    "SAE1",
+    "SET",
+    "SNRPG",
+    "TPRKB",
+    "UBC",
+    "UQCRFS1",
+    "UQCRH",
+    "control",
+]
+CONTROL_LABEL = "control"
+PERT_COL = "perturbation"
+
+N_HVG = 2000
+N_PCS_SIG = 30
+N_PCS_TSNE = 12
+SEED = 42
+
+OUT_DIR = Path(os.environ.get("OUT_DIR", "."))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DATA_ROOT = Path(os.environ.get(
+    "DATA_ROOT",
+    "/cluster/work/boeva/virtual_cell_reasoning/data"
+))
+
+
+def compute_perturbation_signature(
+    adata, is_ctrl, k=K_NN, n_pcs=N_PCS_KNN, chunk=2000
+):
+    """
+    signature_i = x_i - c_i
+
+    c_i is the mean expression of the k nearest controls.
+    PCA and nearest-neighbour search are fitted independently
+    within each dataset.
+
+    A control cell never uses itself as a neighbour.
+    """
+    X = adata.X.toarray() if sparse.issparse(adata.X) else np.asarray(adata.X)
+    X = X.astype(np.float32)
+
+    ctrl_idx = np.flatnonzero(is_ctrl)
+    X_ctrl = X[ctrl_idx]
+
+    pca = PCA(n_components=n_pcs, random_state=SEED).fit(X_ctrl)
+    Z = pca.transform(X)
+
+    nn = NearestNeighbors(n_neighbors=k + 1).fit(Z[ctrl_idx])
+    _, nbr = nn.kneighbors(Z)
+
+    ctrl_pos = np.full(X.shape[0], -1)
+    ctrl_pos[ctrl_idx] = np.arange(len(ctrl_idx))
+
+    self_hit = nbr == ctrl_pos[:, None]
+    drop = np.where(
+        self_hit.any(axis=1),
+        self_hit.argmax(axis=1),
+        k
+    )
+
+    keep = np.ones_like(nbr, dtype=bool)
+    keep[np.arange(nbr.shape[0]), drop] = False
+    nbr = nbr[keep].reshape(-1, k)
+
+    sig = np.empty_like(X)
+
+    for s in range(0, X.shape[0], chunk):
+        e = min(s + chunk, X.shape[0])
+        sig[s:e] = X[s:e] - X_ctrl[nbr[s:e]].mean(axis=1)
+
+    return sig
+
+
+# ---------------------------------------------------------
+# 1. Load datasets and compute HVGs independently
+# ---------------------------------------------------------
+
+adatas = {}
+hvg_sets = {}
+
+for dataset in DATASETS:
+    data_path = DATA_ROOT / dataset / f"{dataset}_processed.h5ad"
+
+    print(f"\nLoading {dataset} from: {data_path}")
+    adata = ad.read_h5ad(data_path)
+
+    print(f"{dataset} shape: {adata.shape}")
+
+    print(f"Computing HVGs for {dataset}...")
+    sc.pp.highly_variable_genes(
+        adata,
+        n_top_genes=N_HVG,
+        flavor="seurat"
+    )
+
+    hvg_sets[dataset] = set(
+        adata.var_names[adata.var["highly_variable"].values]
+    )
+
+    adatas[dataset] = adata
+
+    print(
+        f"{dataset}: {len(hvg_sets[dataset])} HVGs"
+    )
+
+
+# ---------------------------------------------------------
+# 2. Find shared HVGs (intersection)
+# ---------------------------------------------------------
+
+shared_genes = set.intersection(
+    *(set(adatas[d].var_names) for d in DATASETS)
+)
+
+# Union of HVGs across datasets, restricted to shared genes
+shared_hvgs = sorted(
+    set.union(*(hvg_sets[d] for d in DATASETS))
+    & shared_genes
+)
+
+print(f"\nNumber of genes present in both datasets: {len(shared_genes)}")
+print(f"Number of union HVGs present in both datasets: {len(shared_hvgs)}")
+
+if len(shared_hvgs) == 0:
+    raise ValueError("No shared HVGs between the datasets.")
+
+
+# ---------------------------------------------------------
+# 3. Compute signatures independently per dataset
+# ---------------------------------------------------------
+
+signature_adatas = []
+
+for dataset in DATASETS:
+    print(f"\nProcessing signatures for {dataset}...")
+
+    adata = adatas[dataset]
+
+    # Keep only control and target perturbations
+    keep = adata.obs[PERT_COL].isin(
+        PERTURBATIONS + [CONTROL_LABEL]
+    ).values
+
+    # Restrict to shared HVGs
+    adata_sub = adata[keep, shared_hvgs].copy()
+
+    labels = adata_sub.obs[PERT_COL].astype(str).values
+    is_ctrl = labels == CONTROL_LABEL
+
+    print(
+        f"{dataset} subset shape: {adata_sub.shape} | "
+        f"controls: {is_ctrl.sum()}"
+    )
+
+    if is_ctrl.sum() <= K_NN:
+        raise ValueError(
+            f"{dataset} has too few controls for k={K_NN}."
+        )
+
+    print(f"Computing signatures for {dataset}...")
+
+    sig = compute_perturbation_signature(
+        adata_sub,
+        is_ctrl
+    )
+
+    adata_sig = ad.AnnData(
+        X=sig,
+        obs=adata_sub.obs.copy(),
+        var=adata_sub.var.copy()
+    )
+
+    # Explicitly record dataset identity
+    adata_sig.obs["dataset"] = dataset
+
+    signature_adatas.append(adata_sig)
+
+    del adata_sub, adata, sig
+
+
+# ---------------------------------------------------------
+# 4. Concatenate signatures across datasets
+# ---------------------------------------------------------
+
+print("\nConcatenating signature matrices...")
+
+adata_sig_all = ad.concat(
+    signature_adatas,
+    axis=0,
+    join="inner",
+    merge="same",
+    index_unique="-"
+)
+
+print(f"Combined signature shape: {adata_sig_all.shape}")
+
+del signature_adatas, adatas
+
+
+# ---------------------------------------------------------
+# 5. Joint PCA on signatures from both datasets
+# ---------------------------------------------------------
+
+print(f"\nRunning joint PCA ({N_PCS_SIG} components)...")
+
+sc.pp.pca(
+    adata_sig_all,
+    n_comps=N_PCS_SIG,
+    random_state=SEED
+)
+
+
+# ---------------------------------------------------------
+# 6. Joint t-SNE
+# ---------------------------------------------------------
+
+print(
+    f"Running joint t-SNE on the first {N_PCS_TSNE} PCs..."
+)
+
+sc.tl.tsne(
+    adata_sig_all,
+    n_pcs=N_PCS_TSNE,
+    random_state=SEED
+)
+
+tsne = adata_sig_all.obsm["X_tsne"]
+
+labels = adata_sig_all.obs[PERT_COL].astype(str).values
+datasets = adata_sig_all.obs["dataset"].astype(str).values
+
+is_ctrl = labels == CONTROL_LABEL
+
+
+# ---------------------------------------------------------
+# 7. Plot: one t-SNE per perturbation
+# ---------------------------------------------------------
+
+# ---------------------------------------------------------
+# 7. Plot: 20 perturbations per PNG (4 x 5 grid)
+# ---------------------------------------------------------
+
+import re
+
+markers = {
+    "replogle22": "o",
+    "frangieh21": "^"
+}
+
+available_perturbations = [
+    p for p in PERTURBATIONS
+    if p != CONTROL_LABEL and np.any(labels == p)
+]
+
+def safe_filename(name):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+
+PLOTS_PER_FILE = 20
+N_COLS = 5
+N_ROWS = 4
+
+for batch_start in range(0, len(available_perturbations), PLOTS_PER_FILE):
+
+    batch = available_perturbations[
+        batch_start:batch_start + PLOTS_PER_FILE
+    ]
+
+    batch_number = batch_start // PLOTS_PER_FILE + 1
+
+    fig, axes = plt.subplots(
+        N_ROWS, N_COLS,
+        figsize=(25, 20),
+        squeeze=False
+    )
+
+    for ax, perturbation in zip(axes.flat, batch):
+
+        for dataset in DATASETS:
+
+            # Controls
+            ctrl_mask = (
+                (datasets == dataset) &
+                (labels == CONTROL_LABEL)
+            )
+
+            if ctrl_mask.any():
+                ax.scatter(
+                    tsne[ctrl_mask, 0],
+                    tsne[ctrl_mask, 1],
+                    c="lightgray",
+                    marker=markers[dataset],
+                    s=4,
+                    alpha=0.2,
+                    rasterized=True
+                )
+
+            # Selected perturbation
+            pert_mask = (
+                (datasets == dataset) &
+                (labels == perturbation)
+            )
+
+            if pert_mask.any():
+                ax.scatter(
+                    tsne[pert_mask, 0],
+                    tsne[pert_mask, 1],
+                    marker=markers[dataset],
+                    s=5,
+                    alpha=0.6,
+                    label=f"{dataset} (n={pert_mask.sum()})",
+                    rasterized=True
+                )
+
+        ax.set_title(perturbation, fontsize=11, fontweight="bold")
+        ax.set_xlabel("t-SNE 1")
+        ax.set_ylabel("t-SNE 2")
+        ax.tick_params(labelsize=8)
+
+    # Hide unused axes in the last batch
+    for ax in axes.flat[len(batch):]:
+        ax.set_visible(False)
+
+    # Shared legend
+    handles = [
+        plt.Line2D(
+            [0], [0],
+            marker=markers[ds],
+            color="gray",
+            linestyle="None",
+            markersize=7,
+            label=ds
+        )
+        for ds in DATASETS
+    ]
+
+    handles.append(
+        plt.Line2D(
+            [0], [0],
+            marker="o",
+            color="lightgray",
+            linestyle="None",
+            markersize=7,
+            label="Control"
+        )
+    )
+
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        ncol=len(handles),
+        fontsize=10
+    )
+
+    fig.suptitle(
+        f"Joint t-SNE perturbation signatures | "
+        f"{', '.join(DATASETS)} | Batch {batch_number}",
+        fontsize=15,
+        fontweight="bold",
+        y=0.99
+    )
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    out_path = OUT_DIR / (
+        f"joint_tsne_batch_{batch_number:02d}_"
+        f"{safe_filename(DATASETS[0])}_"
+        f"{safe_filename(DATASETS[1])}.png"
+    )
+
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"Saved: {out_path}")
+
+print(
+    f"\nDone! {len(available_perturbations)} perturbations "
+    f"across {(len(available_perturbations) + 19) // 20} PNG files."
+)
+
