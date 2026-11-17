@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 
-DATASET = "adamson16"
+DATASET = "replogle22"
 CONTROL_LABEL = "control"
 
 DATA_PATH = Path(os.environ.get(
