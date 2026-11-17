@@ -1,0 +1,4 @@
+data/*
+.venv/*
+send.sh
+receive.sh
